@@ -17,6 +17,7 @@ import logging
 import threading
 
 import telebot
+from telebot import types
 from flask import Flask
 from playwright.async_api import async_playwright
 
@@ -39,6 +40,12 @@ if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is missing.")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# ---------------------------------------------------------------------------
+# Active task tracking (cancel support)
+# ---------------------------------------------------------------------------
+# Maps chat_id -> {"cancelled": bool}
+active_tasks: dict[int, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Flask health-check server (Render requirement)
@@ -116,6 +123,9 @@ SAME_SITE_MAP = {
 # How many links to check in parallel
 CONCURRENCY = 5
 
+# Hard timeout per single link (seconds) — prevents stuck links
+LINK_TIMEOUT = 20
+
 # How often to send a progress update (every N links)
 PROGRESS_INTERVAL = 10
 
@@ -150,6 +160,44 @@ def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
     return {"cookies": pw_cookies, "origins": []}
 
 
+async def _process_single_link(
+    context, url: str, idx: int, total: int,
+) -> tuple[str, str]:
+    """
+    Check one link in its own page. Returns (url, "FRESH"|"USED"|"ERROR").
+    Has a hard timeout so it never hangs.
+    """
+    page = await context.new_page()
+    try:
+        logger.info("[%d/%d] Checking: %s", idx, total, url)
+        await page.goto(url, timeout=15000)
+        await page.wait_for_timeout(2000)
+
+        # Login wall detection (URL-based — reliable)
+        current_url = page.url
+        if "accounts.google.com" in current_url:
+            logger.warning("  → LOGIN WALL (redirected)")
+            return (url, "USED")
+
+        # Content-based used/fresh detection
+        content = await page.content()
+        if any(phrase in content for phrase in USED_PHRASES):
+            logger.info("  → INVALID / USED")
+            return (url, "USED")
+        else:
+            logger.info("  → FRESH")
+            return (url, "FRESH")
+
+    except Exception as exc:
+        logger.error("  → ERROR: %s", exc)
+        return (url, "USED")
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
 async def _check_links_async(
     urls: list[str],
     storage: dict,
@@ -157,8 +205,9 @@ async def _check_links_async(
 ) -> dict:
     """
     Async engine: opens CONCURRENCY pages in parallel to check links fast.
-    Returns dict with keys: fresh, used.
+    Supports cancellation via active_tasks flag.
     """
+    chat_id = message.chat.id
     fresh: list[str] = []
     used: list[str] = []
     first_done = False
@@ -176,71 +225,74 @@ async def _check_links_async(
 
         semaphore = asyncio.Semaphore(CONCURRENCY)
 
-        async def process_link(url: str, idx: int):
+        async def process_with_guard(url: str, idx: int):
             nonlocal first_done, completed
 
-            async with semaphore:
-                page = await context.new_page()
-                try:
-                    logger.info("[%d/%d] Checking: %s", idx, total, url)
-                    await page.goto(url, timeout=30000)
-                    await page.wait_for_timeout(2000)
+            # Check for cancellation
+            task_info = active_tasks.get(chat_id)
+            if task_info and task_info["cancelled"]:
+                return
 
-                    # --- Debug screenshot (first link only) ---
+            async with semaphore:
+                # Check again after acquiring semaphore
+                task_info = active_tasks.get(chat_id)
+                if task_info and task_info["cancelled"]:
+                    return
+
+                try:
+                    # Hard timeout per link to prevent hanging
+                    result_url, status = await asyncio.wait_for(
+                        _process_single_link(context, url, idx, total),
+                        timeout=LINK_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("[%d/%d] TIMEOUT after %ds: %s", idx, total, LINK_TIMEOUT, url)
+                    result_url, status = url, "USED"
+
+                # Debug screenshot (first link only)
+                if not first_done:
                     async with lock:
                         if not first_done:
                             first_done = True
-                            await page.screenshot(path="debug.png")
                             try:
+                                screenshot_page = await context.new_page()
+                                await screenshot_page.goto(url, timeout=15000)
+                                await screenshot_page.wait_for_timeout(2000)
+                                await screenshot_page.screenshot(path="debug.png")
+                                await screenshot_page.close()
                                 with open("debug.png", "rb") as photo:
                                     bot.send_photo(
-                                        message.chat.id,
-                                        photo,
+                                        chat_id, photo,
                                         caption="📸 Debug: View of the first link (Checking if bypass worked...)",
                                     )
                             except Exception as e:
-                                logger.warning("Screenshot send failed: %s", e)
+                                logger.warning("Debug screenshot failed: %s", e)
 
-                    # --- Login wall detection (URL-based, reliable) ---
-                    current_url = page.url
-                    if "accounts.google.com" in current_url:
-                        used.append(url)
-                        logger.warning("  → LOGIN WALL (redirected to %s)", current_url)
-                        return
+                # Record result
+                if status == "FRESH":
+                    fresh.append(result_url)
+                else:
+                    used.append(result_url)
 
-                    # --- Content-based used/fresh detection ---
-                    content = await page.content()
-                    if any(phrase in content for phrase in USED_PHRASES):
-                        used.append(url)
-                        logger.info("  → INVALID / USED")
-                    else:
-                        fresh.append(url)
-                        logger.info("  → FRESH")
+                completed += 1
 
-                except Exception as exc:
-                    used.append(url)
-                    logger.error("  → ERROR (marked INVALID): %s", exc)
-                finally:
-                    await page.close()
+                # Progress update
+                if (
+                    total > PROGRESS_INTERVAL
+                    and completed % PROGRESS_INTERVAL == 0
+                    and completed < total
+                ):
+                    try:
+                        bot.send_message(
+                            chat_id,
+                            f"⏳ Progress: {completed}/{total} checked "
+                            f"(✅ {len(fresh)} fresh | ❌ {len(used)} used)",
+                        )
+                    except Exception:
+                        pass
 
-                    # Progress update
-                    completed += 1
-                    if (
-                        total > PROGRESS_INTERVAL
-                        and completed % PROGRESS_INTERVAL == 0
-                        and completed < total
-                    ):
-                        try:
-                            bot.send_message(
-                                message.chat.id,
-                                f"⏳ Progress: {completed}/{total} checked "
-                                f"(✅ {len(fresh)} fresh | ❌ {len(used)} used)",
-                            )
-                        except Exception:
-                            pass
-
-        # Fire all tasks; semaphore limits actual concurrency
-        tasks = [process_link(url, idx) for idx, url in enumerate(urls, 1)]
+        # Fire all tasks
+        tasks = [process_with_guard(url, idx) for idx, url in enumerate(urls, 1)]
         await asyncio.gather(*tasks)
 
         # Cleanup
@@ -253,8 +305,9 @@ async def _check_links_async(
 def check_links(urls: list[str], message: telebot.types.Message) -> dict:
     """
     Synchronous wrapper that runs the async checking engine.
-    Called from Telebot handlers (which are synchronous).
     """
+    chat_id = message.chat.id
+
     # Guard: cookies.json must exist
     if not os.path.exists("cookies.json"):
         bot.reply_to(
@@ -262,7 +315,6 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
             "⚠️ Error: `cookies.json` is missing from the server. Authentication required.",
             parse_mode="Markdown",
         )
-        logger.error("cookies.json not found – aborting link check.")
         return {"fresh": [], "used": []}
 
     # Convert cookies
@@ -270,11 +322,31 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
         storage = convert_cookies_to_playwright("cookies.json")
     except Exception as conv_err:
         bot.reply_to(message, f"⚠️ Error reading cookies.json: {conv_err}")
-        logger.error("Cookie conversion failed: %s", conv_err)
         return {"fresh": [], "used": []}
 
-    # Run the async engine
-    return asyncio.run(_check_links_async(urls, storage, message))
+    # Register active task
+    active_tasks[chat_id] = {"cancelled": False}
+
+    # Send cancel button
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ Cancel Checking", callback_data=f"cancel_{chat_id}"))
+    bot.send_message(
+        chat_id,
+        f"🔍 Checking {len(urls)} links ({CONCURRENCY} at a time)...\nPress the button below to cancel.",
+        reply_markup=markup,
+    )
+
+    # Run async engine
+    try:
+        results = asyncio.run(_check_links_async(urls, storage, message))
+    finally:
+        active_tasks.pop(chat_id, None)
+
+    # Check if cancelled
+    if active_tasks.get(chat_id, {}).get("cancelled"):
+        bot.send_message(chat_id, "🛑 Checking was cancelled. Sending partial results...")
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +358,14 @@ def send_results(message: telebot.types.Message, results: dict):
     used = results["used"]
     total = len(fresh) + len(used)
 
+    if total == 0:
+        bot.reply_to(message, "⚠️ No links were checked.")
+        return
+
     summary = (
         f"📊 *Check Complete!*\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🔗 Total links: {total}\n"
+        f"🔗 Total checked: {total}\n"
         f"✅ Fresh links: {len(fresh)}\n"
         f"❌ Invalid/Used links: {len(used)}"
     )
@@ -320,16 +396,44 @@ def handle_start(message: telebot.types.Message):
         "👋 *Welcome to the Bulk Link Checker!*\n\n"
         "I check Google One promo links to see if they're fresh or used.\n\n"
         "📌 *How to use:*\n"
-        "• Send links directly (one per line)\n"
-        "• Or upload a `.txt` file with links\n\n"
-        "I'll check each link and return the fresh ones as a file.",
+        "• Paste links directly in chat (one per line)\n"
+        "• Or upload a `.txt` file with links\n"
+        "• Any number of links accepted\n\n"
+        "I'll check each link and return the fresh ones as a file.\n"
+        "You can cancel anytime with the cancel button.",
         parse_mode="Markdown",
     )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_"))
+def handle_cancel(call: types.CallbackQuery):
+    """Handle cancel button press."""
+    chat_id = int(call.data.split("_", 1)[1])
+    task_info = active_tasks.get(chat_id)
+    if task_info:
+        task_info["cancelled"] = True
+        bot.answer_callback_query(call.id, "🛑 Cancelling... will send partial results.")
+        bot.edit_message_text(
+            "🛑 *Cancelling...* Waiting for current links to finish.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown",
+        )
+        logger.info("User cancelled checking for chat %s", chat_id)
+    else:
+        bot.answer_callback_query(call.id, "No active check to cancel.")
 
 
 @bot.message_handler(content_types=["document"])
 def handle_document(message: telebot.types.Message):
     """Accept a .txt file upload, extract URLs, and check them."""
+    chat_id = message.chat.id
+
+    # Prevent overlapping checks
+    if chat_id in active_tasks:
+        bot.reply_to(message, "⚠️ A check is already running. Cancel it first or wait.")
+        return
+
     doc = message.document
     if not doc.file_name.endswith(".txt"):
         bot.reply_to(message, "⚠️ Please upload a `.txt` file.", parse_mode="Markdown")
@@ -346,9 +450,9 @@ def handle_document(message: telebot.types.Message):
 
     bot.reply_to(
         message,
-        f"⏳ Received {len(urls)} links. Initializing headless browser and checking started...",
+        f"⏳ Received {len(urls)} links. Initializing headless browser...",
     )
-    logger.info("Received %d links from document upload (chat %s)", len(urls), message.chat.id)
+    logger.info("Received %d links from document upload (chat %s)", len(urls), chat_id)
 
     results = check_links(urls, message)
     send_results(message, results)
@@ -357,6 +461,13 @@ def handle_document(message: telebot.types.Message):
 @bot.message_handler(content_types=["text"])
 def handle_text(message: telebot.types.Message):
     """Extract URLs from a plain text message and check them."""
+    chat_id = message.chat.id
+
+    # Prevent overlapping checks
+    if chat_id in active_tasks:
+        bot.reply_to(message, "⚠️ A check is already running. Cancel it first or wait.")
+        return
+
     urls = extract_urls(message.text)
 
     if not urls:
@@ -365,9 +476,9 @@ def handle_text(message: telebot.types.Message):
 
     bot.reply_to(
         message,
-        f"⏳ Received {len(urls)} links. Initializing headless browser and checking started...",
+        f"⏳ Received {len(urls)} links. Initializing headless browser...",
     )
-    logger.info("Received %d links from text message (chat %s)", len(urls), message.chat.id)
+    logger.info("Received %d links from text message (chat %s)", len(urls), chat_id)
 
     results = check_links(urls, message)
     send_results(message, results)
