@@ -95,6 +95,13 @@ SAME_SITE_MAP = {
     "strict": "Strict",
 }
 
+# Phrases that indicate Google is showing a login wall (bypass failed)
+LOGIN_WALL_PHRASES = [
+    "تسجيل الدخول",
+    "Sign in",
+    "accounts.google.com/v3/signin",
+]
+
 
 def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
     """
@@ -122,7 +129,7 @@ def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
             "httpOnly": c.get("httpOnly", False),
             "secure": c.get("secure", False),
             "sameSite": SAME_SITE_MAP.get(
-                (c.get("sameSite") or "").lower(), "None"
+                (c.get("sameSite") or "").lower(), "Lax"
             ),
         }
         pw_cookies.append(pw_cookie)
@@ -192,7 +199,11 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
                 # Read the fully-rendered DOM
                 content = page.content()
 
-                if any(phrase in content for phrase in ARABIC_USED_PHRASES):
+                # Check if we hit a login wall (bypass failed)
+                if any(phrase in content for phrase in LOGIN_WALL_PHRASES):
+                    used.append(url)
+                    logger.warning("  → LOGIN WALL detected (bypass failed) — marked INVALID")
+                elif any(phrase in content for phrase in ARABIC_USED_PHRASES):
                     used.append(url)
                     logger.info("  → INVALID / USED")
                 else:
