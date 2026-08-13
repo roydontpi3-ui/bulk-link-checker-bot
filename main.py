@@ -3,7 +3,7 @@ Telegram Bot — Bulk Google One Link Checker
 ============================================
 Uses Playwright (headless Chromium) to visit Google One promo links,
 bypass the login wall via a pre-exported session state (cookies.json),
-and determine whether each link is FRESH or USED based on Arabic DOM text.
+and determine whether each link is FRESH or USED based on DOM text.
 
 A lightweight Flask health-check server runs in a daemon thread so the
 Render Web Service stays alive and passes port-binding checks.
@@ -11,9 +11,9 @@ Render Web Service stays alive and passes port-binding checks.
 
 import os
 import re
+import json
 import logging
 import threading
-import tempfile
 
 import telebot
 from flask import Flask
@@ -78,9 +78,25 @@ def extract_urls(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Playwright link-checking engine
 # ---------------------------------------------------------------------------
+
+# Arabic phrases indicating a used/claimed link
 ARABIC_USED_PHRASES = [
     "الاشتراك قيد الاستخدام",
     "سبق أن تم استخدام",
+]
+
+# Multi-language phrases that indicate used/claimed (Google renders in various
+# languages depending on account locale — cover the common ones)
+USED_PHRASES_ALL = ARABIC_USED_PHRASES + [
+    "已兌換此促銷活動",          # Chinese Traditional — "This promotion has been redeemed"
+    "此促销活动已被兑换",        # Chinese Simplified
+    "This promotion has already been redeemed",
+    "已有人使用這個促銷優惠",    # Chinese Traditional alt
+    "Subscription already in use",
+    "已有人兌換這個促銷",        # Another Chinese variant
+    "您無法兌換此連結",          # "You cannot redeem this link"
+    "无法兑换此链接",            # Simplified Chinese
+    "لا يمكنك استرداد هذا الرابط",  # Arabic "You can't redeem this link"
 ]
 
 USER_AGENT = (
@@ -101,7 +117,12 @@ LOGIN_WALL_PHRASES = [
     "تسجيل الدخول",
     "Sign in",
     "accounts.google.com/v3/signin",
+    "accounts.google.com/signin",
+    "accounts.google.com/AccountChooser",
 ]
+
+# How often to send a progress update to the user (every N links)
+PROGRESS_INTERVAL = 10
 
 
 def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
@@ -114,19 +135,22 @@ def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
       sameSite       → sameSite ("None" | "Lax" | "Strict")
       Fields like hostOnly / storeId / session are dropped.
     """
-    import json as _json
-
     with open(cookie_editor_path, "r", encoding="utf-8") as fh:
-        raw_cookies = _json.load(fh)
+        raw_cookies = json.load(fh)
 
     pw_cookies = []
     for c in raw_cookies:
+        # Session cookies (no expiry) should get expires = -1
+        expires = c.get("expirationDate", -1)
+        if c.get("session", False) and expires in (None, 0):
+            expires = -1
+
         pw_cookie = {
             "name": c["name"],
             "value": c["value"],
             "domain": c["domain"],
             "path": c.get("path", "/"),
-            "expires": c.get("expirationDate", -1),
+            "expires": expires,
             "httpOnly": c.get("httpOnly", False),
             "secure": c.get("secure", False),
             "sameSite": SAME_SITE_MAP.get(
@@ -144,6 +168,7 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
 
     Returns a dict with keys: fresh (list), used (list).
     Sends a debug screenshot of the very first link to the Telegram chat.
+    Sends periodic progress updates for large batches.
     """
     # Guard: cookies.json must exist on the server
     if not os.path.exists("cookies.json"):
@@ -166,6 +191,7 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
     fresh: list[str] = []
     used: list[str] = []
     is_first_link = True
+    total = len(urls)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -177,7 +203,7 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
         page = context.new_page()
 
         for idx, url in enumerate(urls, start=1):
-            logger.info("[%d/%d] Checking: %s", idx, len(urls), url)
+            logger.info("[%d/%d] Checking: %s", idx, total, url)
             try:
                 page.goto(url, timeout=60000)
                 page.wait_for_timeout(4000)
@@ -204,7 +230,7 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
                 if any(phrase in content for phrase in LOGIN_WALL_PHRASES):
                     used.append(url)
                     logger.warning("  → LOGIN WALL detected (bypass failed) — marked INVALID")
-                elif any(phrase in content for phrase in ARABIC_USED_PHRASES):
+                elif any(phrase in content for phrase in USED_PHRASES_ALL):
                     used.append(url)
                     logger.info("  → INVALID / USED")
                 else:
@@ -214,6 +240,17 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
             except Exception as exc:
                 logger.error("  → ERROR (marked INVALID): %s", exc)
                 used.append(url)
+
+            # Progress update every PROGRESS_INTERVAL links
+            if total > PROGRESS_INTERVAL and idx % PROGRESS_INTERVAL == 0 and idx < total:
+                try:
+                    bot.send_message(
+                        message.chat.id,
+                        f"⏳ Progress: {idx}/{total} links checked... "
+                        f"(✅ {len(fresh)} fresh | ❌ {len(used)} used so far)",
+                    )
+                except Exception:
+                    pass
 
         # Cleanup
         page.close()
@@ -230,12 +267,16 @@ def send_results(message: telebot.types.Message, results: dict):
     """Format and send the checking results back to the user."""
     fresh = results["fresh"]
     used = results["used"]
+    total = len(fresh) + len(used)
 
     summary = (
+        f"📊 *Check Complete!*\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔗 Total links: {total}\n"
         f"✅ Fresh links: {len(fresh)}\n"
         f"❌ Invalid/Used links: {len(used)}"
     )
-    bot.reply_to(message, summary)
+    bot.reply_to(message, summary, parse_mode="Markdown")
     logger.info("Results — Fresh: %d | Used: %d", len(fresh), len(used))
 
     if fresh:
@@ -243,21 +284,28 @@ def send_results(message: telebot.types.Message, results: dict):
         with open(result_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(fresh))
         with open(result_path, "rb") as doc:
-            bot.send_document(message.chat.id, doc)
+            bot.send_document(
+                message.chat.id,
+                doc,
+                caption=f"🟢 {len(fresh)} fresh links ready to use.",
+            )
         logger.info("Sent fresh_links_result.txt to chat %s", message.chat.id)
 
 
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
-@bot.message_handler(commands=["start"])
+@bot.message_handler(commands=["start", "help"])
 def handle_start(message: telebot.types.Message):
     """Welcome message."""
     bot.reply_to(
         message,
-        "👋 Welcome to the *Bulk Link Checker* bot!\n\n"
-        "Send me a list of Google One promo links (one per line) "
-        "or upload a `.txt` file containing the links.",
+        "👋 *Welcome to the Bulk Link Checker!*\n\n"
+        "I check Google One promo links to see if they're fresh or used.\n\n"
+        "📌 *How to use:*\n"
+        "• Send links directly (one per line)\n"
+        "• Or upload a `.txt` file with links\n\n"
+        "I'll check each link and return the fresh ones as a file.",
         parse_mode="Markdown",
     )
 
