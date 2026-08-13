@@ -12,12 +12,13 @@ Render Web Service stays alive and passes port-binding checks.
 import os
 import re
 import json
+import asyncio
 import logging
 import threading
 
 import telebot
 from flask import Flask
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -76,27 +77,27 @@ def extract_urls(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Playwright link-checking engine
+# Playwright link-checking engine (async, parallel)
 # ---------------------------------------------------------------------------
 
-# Arabic phrases indicating a used/claimed link
-ARABIC_USED_PHRASES = [
+# Phrases indicating a used/claimed link (multi-language)
+USED_PHRASES = [
+    # Arabic
     "الاشتراك قيد الاستخدام",
     "سبق أن تم استخدام",
-]
-
-# Multi-language phrases that indicate used/claimed (Google renders in various
-# languages depending on account locale — cover the common ones)
-USED_PHRASES_ALL = ARABIC_USED_PHRASES + [
-    "已兌換此促銷活動",          # Chinese Traditional — "This promotion has been redeemed"
-    "此促销活动已被兑换",        # Chinese Simplified
+    "لا يمكنك استرداد هذا الرابط",
+    # English
     "This promotion has already been redeemed",
-    "已有人使用這個促銷優惠",    # Chinese Traditional alt
     "Subscription already in use",
-    "已有人兌換這個促銷",        # Another Chinese variant
-    "您無法兌換此連結",          # "You cannot redeem this link"
-    "无法兑换此链接",            # Simplified Chinese
-    "لا يمكنك استرداد هذا الرابط",  # Arabic "You can't redeem this link"
+    "You need a new activation link",
+    # Chinese Traditional
+    "已兌換此促銷活動",
+    "已有人使用這個促銷優惠",
+    "已有人兌換這個促銷",
+    "您無法兌換此連結",
+    # Chinese Simplified
+    "此促销活动已被兑换",
+    "无法兑换此链接",
 ]
 
 USER_AGENT = (
@@ -112,16 +113,10 @@ SAME_SITE_MAP = {
     "unspecified": "Lax",
 }
 
-# Phrases that indicate Google is showing a login wall (bypass failed)
-LOGIN_WALL_PHRASES = [
-    "تسجيل الدخول",
-    "Sign in",
-    "accounts.google.com/v3/signin",
-    "accounts.google.com/signin",
-    "accounts.google.com/AccountChooser",
-]
+# How many links to check in parallel
+CONCURRENCY = 5
 
-# How often to send a progress update to the user (every N links)
+# How often to send a progress update (every N links)
 PROGRESS_INTERVAL = 10
 
 
@@ -129,23 +124,17 @@ def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
     """
     Convert a Cookie-Editor JSON export into the Playwright storage_state
     format that ``browser.new_context(storage_state=...)`` expects.
-
-    Cookie-Editor schema → Playwright cookie schema:
-      expirationDate → expires  (float epoch)
-      sameSite       → sameSite ("None" | "Lax" | "Strict")
-      Fields like hostOnly / storeId / session are dropped.
     """
     with open(cookie_editor_path, "r", encoding="utf-8") as fh:
         raw_cookies = json.load(fh)
 
     pw_cookies = []
     for c in raw_cookies:
-        # Session cookies (no expiry) should get expires = -1
         expires = c.get("expirationDate", -1)
-        if c.get("session", False) and expires in (None, 0):
+        if c.get("session", False) and not expires:
             expires = -1
 
-        pw_cookie = {
+        pw_cookies.append({
             "name": c["name"],
             "value": c["value"],
             "domain": c["domain"],
@@ -156,21 +145,117 @@ def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
             "sameSite": SAME_SITE_MAP.get(
                 (c.get("sameSite") or "").lower(), "Lax"
             ),
-        }
-        pw_cookies.append(pw_cookie)
+        })
 
     return {"cookies": pw_cookies, "origins": []}
 
 
+async def _check_links_async(
+    urls: list[str],
+    storage: dict,
+    message: telebot.types.Message,
+) -> dict:
+    """
+    Async engine: opens CONCURRENCY pages in parallel to check links fast.
+    Returns dict with keys: fresh, used.
+    """
+    fresh: list[str] = []
+    used: list[str] = []
+    first_done = False
+    completed = 0
+    total = len(urls)
+    lock = asyncio.Lock()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            storage_state=storage,
+            locale="ar-EG",
+            user_agent=USER_AGENT,
+        )
+
+        semaphore = asyncio.Semaphore(CONCURRENCY)
+
+        async def process_link(url: str, idx: int):
+            nonlocal first_done, completed
+
+            async with semaphore:
+                page = await context.new_page()
+                try:
+                    logger.info("[%d/%d] Checking: %s", idx, total, url)
+                    await page.goto(url, timeout=30000)
+                    await page.wait_for_timeout(2000)
+
+                    # --- Debug screenshot (first link only) ---
+                    async with lock:
+                        if not first_done:
+                            first_done = True
+                            await page.screenshot(path="debug.png")
+                            try:
+                                with open("debug.png", "rb") as photo:
+                                    bot.send_photo(
+                                        message.chat.id,
+                                        photo,
+                                        caption="📸 Debug: View of the first link (Checking if bypass worked...)",
+                                    )
+                            except Exception as e:
+                                logger.warning("Screenshot send failed: %s", e)
+
+                    # --- Login wall detection (URL-based, reliable) ---
+                    current_url = page.url
+                    if "accounts.google.com" in current_url:
+                        used.append(url)
+                        logger.warning("  → LOGIN WALL (redirected to %s)", current_url)
+                        return
+
+                    # --- Content-based used/fresh detection ---
+                    content = await page.content()
+                    if any(phrase in content for phrase in USED_PHRASES):
+                        used.append(url)
+                        logger.info("  → INVALID / USED")
+                    else:
+                        fresh.append(url)
+                        logger.info("  → FRESH")
+
+                except Exception as exc:
+                    used.append(url)
+                    logger.error("  → ERROR (marked INVALID): %s", exc)
+                finally:
+                    await page.close()
+
+                    # Progress update
+                    completed += 1
+                    if (
+                        total > PROGRESS_INTERVAL
+                        and completed % PROGRESS_INTERVAL == 0
+                        and completed < total
+                    ):
+                        try:
+                            bot.send_message(
+                                message.chat.id,
+                                f"⏳ Progress: {completed}/{total} checked "
+                                f"(✅ {len(fresh)} fresh | ❌ {len(used)} used)",
+                            )
+                        except Exception:
+                            pass
+
+        # Fire all tasks; semaphore limits actual concurrency
+        tasks = [process_link(url, idx) for idx, url in enumerate(urls, 1)]
+        await asyncio.gather(*tasks)
+
+        # Cleanup
+        await context.close()
+        await browser.close()
+
+    return {"fresh": fresh, "used": used}
+
+
 def check_links(urls: list[str], message: telebot.types.Message) -> dict:
     """
-    Visit every URL with Playwright, classify as FRESH or USED.
-
-    Returns a dict with keys: fresh (list), used (list).
-    Sends a debug screenshot of the very first link to the Telegram chat.
-    Sends periodic progress updates for large batches.
+    Synchronous wrapper that runs the async checking engine.
+    Called from Telebot handlers (which are synchronous).
     """
-    # Guard: cookies.json must exist on the server
+    # Guard: cookies.json must exist
     if not os.path.exists("cookies.json"):
         bot.reply_to(
             message,
@@ -180,7 +265,7 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
         logger.error("cookies.json not found – aborting link check.")
         return {"fresh": [], "used": []}
 
-    # Convert Cookie-Editor format → Playwright storage_state
+    # Convert cookies
     try:
         storage = convert_cookies_to_playwright("cookies.json")
     except Exception as conv_err:
@@ -188,76 +273,8 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
         logger.error("Cookie conversion failed: %s", conv_err)
         return {"fresh": [], "used": []}
 
-    fresh: list[str] = []
-    used: list[str] = []
-    is_first_link = True
-    total = len(urls)
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(
-            storage_state=storage,
-            locale="ar-EG",
-            user_agent=USER_AGENT,
-        )
-        page = context.new_page()
-
-        for idx, url in enumerate(urls, start=1):
-            logger.info("[%d/%d] Checking: %s", idx, total, url)
-            try:
-                page.goto(url, timeout=60000)
-                page.wait_for_timeout(4000)
-
-                # Debug screenshot for the first link only
-                if is_first_link:
-                    screenshot_path = "debug.png"
-                    page.screenshot(path=screenshot_path)
-                    try:
-                        with open(screenshot_path, "rb") as photo:
-                            bot.send_photo(
-                                message.chat.id,
-                                photo,
-                                caption="📸 Debug: View of the first link (Checking if bypass worked...)",
-                            )
-                    except Exception as send_err:
-                        logger.warning("Could not send debug screenshot: %s", send_err)
-                    is_first_link = False
-
-                # Read the fully-rendered DOM
-                content = page.content()
-
-                # Check if we hit a login wall (bypass failed)
-                if any(phrase in content for phrase in LOGIN_WALL_PHRASES):
-                    used.append(url)
-                    logger.warning("  → LOGIN WALL detected (bypass failed) — marked INVALID")
-                elif any(phrase in content for phrase in USED_PHRASES_ALL):
-                    used.append(url)
-                    logger.info("  → INVALID / USED")
-                else:
-                    fresh.append(url)
-                    logger.info("  → FRESH")
-
-            except Exception as exc:
-                logger.error("  → ERROR (marked INVALID): %s", exc)
-                used.append(url)
-
-            # Progress update every PROGRESS_INTERVAL links
-            if total > PROGRESS_INTERVAL and idx % PROGRESS_INTERVAL == 0 and idx < total:
-                try:
-                    bot.send_message(
-                        message.chat.id,
-                        f"⏳ Progress: {idx}/{total} links checked... "
-                        f"(✅ {len(fresh)} fresh | ❌ {len(used)} used so far)",
-                    )
-                except Exception:
-                    pass
-
-        # Cleanup
-        page.close()
-        context.close()
-        browser.close()
-
-    return {"fresh": fresh, "used": used}
+    # Run the async engine
+    return asyncio.run(_check_links_async(urls, storage, message))
 
 
 # ---------------------------------------------------------------------------
