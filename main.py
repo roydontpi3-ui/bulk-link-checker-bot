@@ -1,12 +1,8 @@
 """
-Telegram Bot — Bulk Google One Link Checker
-============================================
-Uses Playwright (headless Chromium) to visit Google One promo links,
-bypass the login wall via a pre-exported session state (cookies.json),
-and determine whether each link is FRESH or USED based on DOM text.
-
-A lightweight Flask health-check server runs in a daemon thread so the
-Render Web Service stays alive and passes port-binding checks.
+Telegram Bot — Bulk Google One Link Checker (Customer Edition)
+===============================================================
+Professional customer-facing bot that checks Google One promo links.
+Requires users to join a Telegram channel before use.
 """
 
 import os
@@ -32,19 +28,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Telegram Bot initialisation
+# Configuration
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     logger.critical("BOT_TOKEN environment variable is not set. Exiting.")
     raise SystemExit("BOT_TOKEN is missing.")
 
+# Channel that users must join before using the bot
+REQUIRED_CHANNEL = "@samsshopofficial"
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ---------------------------------------------------------------------------
 # Active task tracking (cancel support)
 # ---------------------------------------------------------------------------
-# Maps chat_id -> {"cancelled": bool}
 active_tasks: dict[int, dict] = {}
 
 # ---------------------------------------------------------------------------
@@ -55,15 +53,48 @@ app = Flask(__name__)
 
 @app.route("/")
 def health_check():
-    """Return HTTP 200 so Render's health probe is satisfied."""
     return "Bot is active and running!", 200
 
 
 def keep_alive():
-    """Run the Flask app on the Render-assigned PORT (default 10000)."""
     port = int(os.environ.get("PORT", 10000))
     logger.info("Flask health-check server starting on port %s", port)
     app.run(host="0.0.0.0", port=port)
+
+
+# ---------------------------------------------------------------------------
+# Channel membership check
+# ---------------------------------------------------------------------------
+def is_channel_member(user_id: int) -> bool:
+    """Check if user is a member of the required channel."""
+    try:
+        member = bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        logger.warning("Channel check failed for %s: %s", user_id, e)
+        return False
+
+
+def send_join_message(message: telebot.types.Message):
+    """Send a styled message asking user to join the channel."""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "📢 Join Channel", url=f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}"
+        ),
+        types.InlineKeyboardButton(
+            "✅ I've Joined", callback_data="check_membership"
+        ),
+    )
+    bot.reply_to(
+        message,
+        "🔒 *Access Required*\n\n"
+        f"To use this bot, you need to join our channel first:\n"
+        f"👉 {REQUIRED_CHANNEL}\n\n"
+        "After joining, tap the button below to verify.",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -87,19 +118,14 @@ def extract_urls(text: str) -> list[str]:
 # Playwright link-checking engine (async, parallel)
 # ---------------------------------------------------------------------------
 
-# Phrases indicating a used/claimed link (multi-language)
 USED_PHRASES = [
-    # Arabic
     "الاشتراك قيد الاستخدام",
     "سبق أن تم استخدام",
-    # English
     "This promotion has already been redeemed",
     "Subscription already in use",
-    # Chinese Traditional
     "已兌換此促銷活動",
     "已有人使用這個促銷優惠",
     "已有人兌換這個促銷",
-    # Chinese Simplified
     "此促销活动已被兑换",
 ]
 
@@ -116,21 +142,13 @@ SAME_SITE_MAP = {
     "unspecified": "Lax",
 }
 
-# How many links to check in parallel
 CONCURRENCY = 5
-
-# Hard timeout per single link (seconds) — prevents stuck links
 LINK_TIMEOUT = 50
-
-# How often to send a progress update (every N links)
 PROGRESS_INTERVAL = 10
 
 
 def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
-    """
-    Convert a Cookie-Editor JSON export into the Playwright storage_state
-    format that ``browser.new_context(storage_state=...)`` expects.
-    """
+    """Convert a Cookie-Editor JSON export to Playwright storage_state format."""
     with open(cookie_editor_path, "r", encoding="utf-8") as fh:
         raw_cookies = json.load(fh)
 
@@ -139,7 +157,6 @@ def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
         expires = c.get("expirationDate", -1)
         if c.get("session", False) and not expires:
             expires = -1
-
         pw_cookies.append({
             "name": c["name"],
             "value": c["value"],
@@ -152,42 +169,25 @@ def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
                 (c.get("sameSite") or "").lower(), "Lax"
             ),
         })
-
     return {"cookies": pw_cookies, "origins": []}
 
 
 async def _process_single_link(
     context, url: str, idx: int, total: int,
-    take_screenshot: bool = False, chat_id: int = 0,
 ) -> tuple[str, str]:
-    """
-    Check one link in its own page. Returns (url, "FRESH"|"USED").
-    """
+    """Check one link. Returns (url, 'FRESH'|'USED'|'ERROR')."""
     page = await context.new_page()
     try:
         logger.info("[%d/%d] Checking: %s", idx, total, url)
         await page.goto(url, timeout=45000)
         await page.wait_for_timeout(2000)
 
-        # Debug screenshot if requested
-        if take_screenshot and chat_id:
-            try:
-                await page.screenshot(path="debug.png")
-                with open("debug.png", "rb") as photo:
-                    bot.send_photo(
-                        chat_id, photo,
-                        caption="📸 Debug: View of the first link (Checking if bypass worked...)",
-                    )
-            except Exception as e:
-                logger.warning("Screenshot failed: %s", e)
-
-        # Login wall detection (URL-based — reliable)
-        current_url = page.url
-        if "accounts.google.com" in current_url:
-            logger.warning("  → LOGIN WALL (redirected to %s)", current_url)
+        # Login wall detection (URL-based)
+        if "accounts.google.com" in page.url:
+            logger.warning("  → LOGIN WALL")
             return (url, "USED")
 
-        # Content-based used/fresh detection
+        # Content-based detection
         content = await page.content()
         for phrase in USED_PHRASES:
             if phrase in content:
@@ -198,7 +198,7 @@ async def _process_single_link(
         return (url, "FRESH")
 
     except Exception as exc:
-        logger.error("  → ERROR (timeout/crash, skipped): %s", exc)
+        logger.error("  → ERROR: %s", exc)
         return (url, "ERROR")
     finally:
         try:
@@ -212,18 +212,11 @@ async def _check_links_async(
     storage: dict,
     message: telebot.types.Message,
 ) -> dict:
-    """
-    Async engine: opens CONCURRENCY pages in parallel to check links fast.
-    Supports cancellation via active_tasks flag.
-    """
+    """Async engine: checks links in parallel."""
     chat_id = message.chat.id
-    fresh: list[str] = []
-    used: list[str] = []
-    skipped: list[str] = []
-    first_done = False
+    fresh, used, skipped = [], [], []
     completed = 0
     total = len(urls)
-    lock = asyncio.Lock()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -236,70 +229,58 @@ async def _check_links_async(
         semaphore = asyncio.Semaphore(CONCURRENCY)
 
         async def process_with_guard(url: str, idx: int):
-            nonlocal first_done, completed
+            nonlocal completed
 
-            # Check for cancellation
             task_info = active_tasks.get(chat_id)
             if task_info and task_info["cancelled"]:
                 return
 
             async with semaphore:
-                # Check again after acquiring semaphore
                 task_info = active_tasks.get(chat_id)
                 if task_info and task_info["cancelled"]:
                     return
 
-                # Should this link take a screenshot?
-                need_screenshot = False
-                async with lock:
-                    if not first_done:
-                        first_done = True
-                        need_screenshot = True
-
                 try:
                     result_url, status = await asyncio.wait_for(
-                        _process_single_link(
-                            context, url, idx, total,
-                            take_screenshot=need_screenshot,
-                            chat_id=chat_id,
-                        ),
+                        _process_single_link(context, url, idx, total),
                         timeout=LINK_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.error("[%d/%d] TIMEOUT after %ds: %s", idx, total, LINK_TIMEOUT, url)
+                    logger.error("[%d/%d] TIMEOUT: %s", idx, total, url)
                     result_url, status = url, "ERROR"
 
-                # Record result — ERROR links are skipped, not counted as used
                 if status == "FRESH":
                     fresh.append(result_url)
                 elif status == "USED":
                     used.append(result_url)
                 else:
-                    # ERROR — don't count as used, log and skip
                     skipped.append(result_url)
 
                 completed += 1
 
-                # Progress update
                 if (
                     total > PROGRESS_INTERVAL
                     and completed % PROGRESS_INTERVAL == 0
                     and completed < total
                 ):
+                    pct = int(completed / total * 100)
+                    bar_filled = int(pct / 5)
+                    bar = "▓" * bar_filled + "░" * (20 - bar_filled)
                     try:
                         bot.send_message(
                             chat_id,
-                            f"⏳ Progress: {completed}/{total} checked "
-                            f"(✅ {len(fresh)} fresh | ❌ {len(used)} used)",
+                            f"⏳ *Checking in progress...*\n"
+                            f"`{bar}` {pct}%\n"
+                            f"📊 {completed}/{total} links\n"
+                            f"✅ {len(fresh)} fresh  •  ❌ {len(used)} used",
+                            parse_mode="Markdown",
                         )
                     except Exception:
                         pass
 
-        # Fire all tasks
         tasks = [process_with_guard(url, idx) for idx, url in enumerate(urls, 1)]
         await asyncio.gather(*tasks)
 
-        # Cleanup
         await context.close()
         await browser.close()
 
@@ -307,57 +288,48 @@ async def _check_links_async(
 
 
 def check_links(urls: list[str], message: telebot.types.Message) -> dict:
-    """
-    Synchronous wrapper that runs the async checking engine.
-    """
+    """Synchronous wrapper for the async engine."""
     chat_id = message.chat.id
 
-    # Guard: cookies.json must exist
     if not os.path.exists("cookies.json"):
-        bot.reply_to(
-            message,
-            "⚠️ Error: `cookies.json` is missing from the server. Authentication required.",
-            parse_mode="Markdown",
-        )
-        return {"fresh": [], "used": []}
+        bot.reply_to(message, "⚠️ Service temporarily unavailable. Contact admin.")
+        return {"fresh": [], "used": [], "skipped": []}
 
-    # Convert cookies
     try:
         storage = convert_cookies_to_playwright("cookies.json")
-    except Exception as conv_err:
-        bot.reply_to(message, f"⚠️ Error reading cookies.json: {conv_err}")
-        return {"fresh": [], "used": []}
+    except Exception:
+        bot.reply_to(message, "⚠️ Service temporarily unavailable. Contact admin.")
+        return {"fresh": [], "used": [], "skipped": []}
 
-    # Register active task
     active_tasks[chat_id] = {"cancelled": False}
 
-    # Send cancel button
+    # Send cancel button with styled message
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("❌ Cancel Checking", callback_data=f"cancel_{chat_id}"))
+    markup.add(types.InlineKeyboardButton(
+        "🛑 Cancel", callback_data=f"cancel_{chat_id}"
+    ))
     bot.send_message(
         chat_id,
-        f"🔍 Checking {len(urls)} links ({CONCURRENCY} at a time)...\nPress the button below to cancel.",
+        f"🔍 *Checking {len(urls)} links...*\n"
+        f"⚡ Processing {CONCURRENCY} links simultaneously\n\n"
+        f"_You can cancel anytime using the button below._",
+        parse_mode="Markdown",
         reply_markup=markup,
     )
 
-    # Run async engine
     try:
         results = asyncio.run(_check_links_async(urls, storage, message))
     finally:
         active_tasks.pop(chat_id, None)
 
-    # Check if cancelled
-    if active_tasks.get(chat_id, {}).get("cancelled"):
-        bot.send_message(chat_id, "🛑 Checking was cancelled. Sending partial results...")
-
     return results
 
 
 # ---------------------------------------------------------------------------
-# Result reporting helper
+# Result reporting
 # ---------------------------------------------------------------------------
 def send_results(message: telebot.types.Message, results: dict):
-    """Format and send the checking results back to the user."""
+    """Send formatted results to user."""
     fresh = results["fresh"]
     used = results["used"]
     skipped = results.get("skipped", [])
@@ -367,15 +339,21 @@ def send_results(message: telebot.types.Message, results: dict):
         bot.reply_to(message, "⚠️ No links were checked.")
         return
 
+    # Build styled summary
+    fresh_pct = int(len(fresh) / total * 100) if total else 0
     summary = (
-        f"📊 *Check Complete!*\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🔗 Total links: {total}\n"
-        f"✅ Fresh links: {len(fresh)}\n"
-        f"❌ Used links: {len(used)}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"  📊  *CHECK COMPLETE*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"  🔗  Total links: *{total}*\n"
+        f"  ✅  Fresh: *{len(fresh)}* ({fresh_pct}%)\n"
+        f"  ❌  Used: *{len(used)}*\n"
     )
     if skipped:
-        summary += f"\n⚠️ Skipped (errors/timeout): {len(skipped)}"
+        summary += f"  ⚠️  Skipped: *{len(skipped)}*\n"
+
+    summary += f"\n━━━━━━━━━━━━━━━━━━━━"
+
     bot.reply_to(message, summary, parse_mode="Markdown")
     logger.info("Results — Fresh: %d | Used: %d | Skipped: %d", len(fresh), len(used), len(skipped))
 
@@ -387,9 +365,8 @@ def send_results(message: telebot.types.Message, results: dict):
             bot.send_document(
                 message.chat.id,
                 doc,
-                caption=f"🟢 {len(fresh)} fresh links ready to use.",
+                caption=f"✅ {len(fresh)} fresh links • Ready to use",
             )
-        logger.info("Sent fresh_links_result.txt to chat %s", message.chat.id)
 
 
 # ---------------------------------------------------------------------------
@@ -397,19 +374,81 @@ def send_results(message: telebot.types.Message, results: dict):
 # ---------------------------------------------------------------------------
 @bot.message_handler(commands=["start", "help"])
 def handle_start(message: telebot.types.Message):
-    """Welcome message."""
+    """Welcome message with styled buttons."""
+    if not is_channel_member(message.from_user.id):
+        send_join_message(message)
+        return
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    markup.row("📋 How to Use", "📊 Status")
+
     bot.reply_to(
         message,
-        "👋 *Welcome to the Bulk Link Checker!*\n\n"
-        "I check Google One promo links to see if they're fresh or used.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "  🔍  *SAMS Link Checker*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Check Google One promo links\n"
+        "instantly to find fresh ones.\n\n"
         "📌 *How to use:*\n"
-        "• Paste links directly in chat (one per line)\n"
-        "• Or upload a `.txt` file with links\n"
-        "• Any number of links accepted\n\n"
-        "I'll check each link and return the fresh ones as a file.\n"
-        "You can cancel anytime with the cancel button.",
+        "├ Paste links in chat (one per line)\n"
+        "├ Or upload a `.txt` file\n"
+        "└ Any number of links accepted\n\n"
+        "⚡ Fast parallel checking\n"
+        "🛑 Cancel anytime\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"  📢 Channel: {REQUIRED_CHANNEL}\n"
+        "━━━━━━━━━━━━━━━━━━━━",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 How to Use")
+def handle_how_to(message: telebot.types.Message):
+    """How to use guide."""
+    bot.reply_to(
+        message,
+        "📋 *How to Check Links:*\n\n"
+        "*Option 1 — Paste directly:*\n"
+        "Copy your links and paste them in this chat.\n"
+        "One link per line.\n\n"
+        "*Option 2 — Upload file:*\n"
+        "Send a `.txt` file containing your links.\n"
+        "One link per line.\n\n"
+        "The bot will check all links and send back\n"
+        "the fresh ones as a file. ✅",
         parse_mode="Markdown",
     )
+
+
+@bot.message_handler(func=lambda m: m.text == "📊 Status")
+def handle_status(message: telebot.types.Message):
+    """Bot status."""
+    chat_id = message.chat.id
+    if chat_id in active_tasks:
+        bot.reply_to(message, "🔄 A check is currently running...")
+    else:
+        bot.reply_to(message, "✅ Bot is ready. Send links to check.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_membership")
+def handle_membership_check(call: types.CallbackQuery):
+    """Verify channel membership after user clicks 'I've Joined'."""
+    if is_channel_member(call.from_user.id):
+        bot.answer_callback_query(call.id, "✅ Verified! You can now use the bot.")
+        bot.edit_message_text(
+            "✅ *Access Granted!*\n\n"
+            "Send /start to begin using the bot.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown",
+        )
+    else:
+        bot.answer_callback_query(
+            call.id,
+            "❌ You haven't joined the channel yet. Please join first.",
+            show_alert=True,
+        )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_"))
@@ -419,24 +458,25 @@ def handle_cancel(call: types.CallbackQuery):
     task_info = active_tasks.get(chat_id)
     if task_info:
         task_info["cancelled"] = True
-        bot.answer_callback_query(call.id, "🛑 Cancelling... will send partial results.")
+        bot.answer_callback_query(call.id, "🛑 Cancelling...")
         bot.edit_message_text(
-            "🛑 *Cancelling...* Waiting for current links to finish.",
+            "🛑 *Cancelling...* Finishing current links.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="Markdown",
         )
-        logger.info("User cancelled checking for chat %s", chat_id)
     else:
         bot.answer_callback_query(call.id, "No active check to cancel.")
 
 
 @bot.message_handler(content_types=["document"])
 def handle_document(message: telebot.types.Message):
-    """Accept a .txt file upload, extract URLs, and check them."""
-    chat_id = message.chat.id
+    """Accept a .txt file upload."""
+    if not is_channel_member(message.from_user.id):
+        send_join_message(message)
+        return
 
-    # Prevent overlapping checks
+    chat_id = message.chat.id
     if chat_id in active_tasks:
         bot.reply_to(message, "⚠️ A check is already running. Cancel it first or wait.")
         return
@@ -452,14 +492,11 @@ def handle_document(message: telebot.types.Message):
     urls = extract_urls(text)
 
     if not urls:
-        bot.reply_to(message, "❌ No valid URLs found in the uploaded file.")
+        bot.reply_to(message, "❌ No valid URLs found in the file.")
         return
 
-    bot.reply_to(
-        message,
-        f"⏳ Received {len(urls)} links. Initializing headless browser...",
-    )
-    logger.info("Received %d links from document upload (chat %s)", len(urls), chat_id)
+    bot.reply_to(message, f"📥 *{len(urls)} links received.*", parse_mode="Markdown")
+    logger.info("Received %d links from document (chat %s)", len(urls), chat_id)
 
     results = check_links(urls, message)
     send_results(message, results)
@@ -467,25 +504,23 @@ def handle_document(message: telebot.types.Message):
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message: telebot.types.Message):
-    """Extract URLs from a plain text message and check them."""
-    chat_id = message.chat.id
+    """Extract URLs from text messages."""
+    if not is_channel_member(message.from_user.id):
+        send_join_message(message)
+        return
 
-    # Prevent overlapping checks
+    chat_id = message.chat.id
     if chat_id in active_tasks:
         bot.reply_to(message, "⚠️ A check is already running. Cancel it first or wait.")
         return
 
     urls = extract_urls(message.text)
-
     if not urls:
-        bot.reply_to(message, "❌ No valid URLs detected in your message.")
+        bot.reply_to(message, "❌ No valid URLs detected. Send links or upload a `.txt` file.", parse_mode="Markdown")
         return
 
-    bot.reply_to(
-        message,
-        f"⏳ Received {len(urls)} links. Initializing headless browser...",
-    )
-    logger.info("Received %d links from text message (chat %s)", len(urls), chat_id)
+    bot.reply_to(message, f"📥 *{len(urls)} links received.*", parse_mode="Markdown")
+    logger.info("Received %d links from text (chat %s)", len(urls), chat_id)
 
     results = check_links(urls, message)
     send_results(message, results)
@@ -495,11 +530,9 @@ def handle_text(message: telebot.types.Message):
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Start Flask health-check in a background daemon thread
     server_thread = threading.Thread(target=keep_alive, daemon=True)
     server_thread.start()
     logger.info("Health-check thread started.")
 
-    # Start Telegram long-polling (blocks the main thread)
     logger.info("Starting Telegram bot polling…")
     bot.infinity_polling(logger_level=logging.INFO)
