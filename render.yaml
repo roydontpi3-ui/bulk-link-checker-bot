@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: bulk-link-checker-bot
+    env: python
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false

@@ -1,0 +1,4 @@
+pyTelegramBotAPI
+playwright
+Flask
+waitress
