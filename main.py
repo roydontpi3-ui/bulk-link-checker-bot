@@ -92,19 +92,15 @@ USED_PHRASES = [
     # Arabic
     "الاشتراك قيد الاستخدام",
     "سبق أن تم استخدام",
-    "لا يمكنك استرداد هذا الرابط",
     # English
     "This promotion has already been redeemed",
     "Subscription already in use",
-    "You need a new activation link",
     # Chinese Traditional
     "已兌換此促銷活動",
     "已有人使用這個促銷優惠",
     "已有人兌換這個促銷",
-    "您無法兌換此連結",
     # Chinese Simplified
     "此促销活动已被兑换",
-    "无法兑换此链接",
 ]
 
 USER_AGENT = (
@@ -124,7 +120,7 @@ SAME_SITE_MAP = {
 CONCURRENCY = 5
 
 # Hard timeout per single link (seconds) — prevents stuck links
-LINK_TIMEOUT = 20
+LINK_TIMEOUT = 50
 
 # How often to send a progress update (every N links)
 PROGRESS_INTERVAL = 10
@@ -162,35 +158,48 @@ def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
 
 async def _process_single_link(
     context, url: str, idx: int, total: int,
+    take_screenshot: bool = False, chat_id: int = 0,
 ) -> tuple[str, str]:
     """
-    Check one link in its own page. Returns (url, "FRESH"|"USED"|"ERROR").
-    Has a hard timeout so it never hangs.
+    Check one link in its own page. Returns (url, "FRESH"|"USED").
     """
     page = await context.new_page()
     try:
         logger.info("[%d/%d] Checking: %s", idx, total, url)
-        await page.goto(url, timeout=15000)
+        await page.goto(url, timeout=45000)
         await page.wait_for_timeout(2000)
+
+        # Debug screenshot if requested
+        if take_screenshot and chat_id:
+            try:
+                await page.screenshot(path="debug.png")
+                with open("debug.png", "rb") as photo:
+                    bot.send_photo(
+                        chat_id, photo,
+                        caption="📸 Debug: View of the first link (Checking if bypass worked...)",
+                    )
+            except Exception as e:
+                logger.warning("Screenshot failed: %s", e)
 
         # Login wall detection (URL-based — reliable)
         current_url = page.url
         if "accounts.google.com" in current_url:
-            logger.warning("  → LOGIN WALL (redirected)")
+            logger.warning("  → LOGIN WALL (redirected to %s)", current_url)
             return (url, "USED")
 
         # Content-based used/fresh detection
         content = await page.content()
-        if any(phrase in content for phrase in USED_PHRASES):
-            logger.info("  → INVALID / USED")
-            return (url, "USED")
-        else:
-            logger.info("  → FRESH")
-            return (url, "FRESH")
+        for phrase in USED_PHRASES:
+            if phrase in content:
+                logger.info("  → USED (matched: %s)", phrase)
+                return (url, "USED")
+
+        logger.info("  → FRESH ✓")
+        return (url, "FRESH")
 
     except Exception as exc:
-        logger.error("  → ERROR: %s", exc)
-        return (url, "USED")
+        logger.error("  → ERROR (timeout/crash, skipped): %s", exc)
+        return (url, "ERROR")
     finally:
         try:
             await page.close()
@@ -210,6 +219,7 @@ async def _check_links_async(
     chat_id = message.chat.id
     fresh: list[str] = []
     used: list[str] = []
+    skipped: list[str] = []
     first_done = False
     completed = 0
     total = len(urls)
@@ -239,40 +249,34 @@ async def _check_links_async(
                 if task_info and task_info["cancelled"]:
                     return
 
+                # Should this link take a screenshot?
+                need_screenshot = False
+                async with lock:
+                    if not first_done:
+                        first_done = True
+                        need_screenshot = True
+
                 try:
-                    # Hard timeout per link to prevent hanging
                     result_url, status = await asyncio.wait_for(
-                        _process_single_link(context, url, idx, total),
+                        _process_single_link(
+                            context, url, idx, total,
+                            take_screenshot=need_screenshot,
+                            chat_id=chat_id,
+                        ),
                         timeout=LINK_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     logger.error("[%d/%d] TIMEOUT after %ds: %s", idx, total, LINK_TIMEOUT, url)
-                    result_url, status = url, "USED"
+                    result_url, status = url, "ERROR"
 
-                # Debug screenshot (first link only)
-                if not first_done:
-                    async with lock:
-                        if not first_done:
-                            first_done = True
-                            try:
-                                screenshot_page = await context.new_page()
-                                await screenshot_page.goto(url, timeout=15000)
-                                await screenshot_page.wait_for_timeout(2000)
-                                await screenshot_page.screenshot(path="debug.png")
-                                await screenshot_page.close()
-                                with open("debug.png", "rb") as photo:
-                                    bot.send_photo(
-                                        chat_id, photo,
-                                        caption="📸 Debug: View of the first link (Checking if bypass worked...)",
-                                    )
-                            except Exception as e:
-                                logger.warning("Debug screenshot failed: %s", e)
-
-                # Record result
+                # Record result — ERROR links are skipped, not counted as used
                 if status == "FRESH":
                     fresh.append(result_url)
-                else:
+                elif status == "USED":
                     used.append(result_url)
+                else:
+                    # ERROR — don't count as used, log and skip
+                    skipped.append(result_url)
 
                 completed += 1
 
@@ -299,7 +303,7 @@ async def _check_links_async(
         await context.close()
         await browser.close()
 
-    return {"fresh": fresh, "used": used}
+    return {"fresh": fresh, "used": used, "skipped": skipped}
 
 
 def check_links(urls: list[str], message: telebot.types.Message) -> dict:
@@ -356,7 +360,8 @@ def send_results(message: telebot.types.Message, results: dict):
     """Format and send the checking results back to the user."""
     fresh = results["fresh"]
     used = results["used"]
-    total = len(fresh) + len(used)
+    skipped = results.get("skipped", [])
+    total = len(fresh) + len(used) + len(skipped)
 
     if total == 0:
         bot.reply_to(message, "⚠️ No links were checked.")
@@ -365,12 +370,14 @@ def send_results(message: telebot.types.Message, results: dict):
     summary = (
         f"📊 *Check Complete!*\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🔗 Total checked: {total}\n"
+        f"🔗 Total links: {total}\n"
         f"✅ Fresh links: {len(fresh)}\n"
-        f"❌ Invalid/Used links: {len(used)}"
+        f"❌ Used links: {len(used)}"
     )
+    if skipped:
+        summary += f"\n⚠️ Skipped (errors/timeout): {len(skipped)}"
     bot.reply_to(message, summary, parse_mode="Markdown")
-    logger.info("Results — Fresh: %d | Used: %d", len(fresh), len(used))
+    logger.info("Results — Fresh: %d | Used: %d | Skipped: %d", len(fresh), len(used), len(skipped))
 
     if fresh:
         result_path = "fresh_links_result.txt"
