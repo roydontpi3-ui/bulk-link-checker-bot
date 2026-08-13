@@ -93,6 +93,7 @@ SAME_SITE_MAP = {
     "no_restriction": "None",
     "lax": "Lax",
     "strict": "Strict",
+    "unspecified": "Lax",
 }
 
 # Phrases that indicate Google is showing a login wall (bypass failed)
