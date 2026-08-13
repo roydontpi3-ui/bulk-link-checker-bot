@@ -89,6 +89,46 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+SAME_SITE_MAP = {
+    "no_restriction": "None",
+    "lax": "Lax",
+    "strict": "Strict",
+}
+
+
+def convert_cookies_to_playwright(cookie_editor_path: str) -> dict:
+    """
+    Convert a Cookie-Editor JSON export into the Playwright storage_state
+    format that ``browser.new_context(storage_state=...)`` expects.
+
+    Cookie-Editor schema → Playwright cookie schema:
+      expirationDate → expires  (float epoch)
+      sameSite       → sameSite ("None" | "Lax" | "Strict")
+      Fields like hostOnly / storeId / session are dropped.
+    """
+    import json as _json
+
+    with open(cookie_editor_path, "r", encoding="utf-8") as fh:
+        raw_cookies = _json.load(fh)
+
+    pw_cookies = []
+    for c in raw_cookies:
+        pw_cookie = {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c["domain"],
+            "path": c.get("path", "/"),
+            "expires": c.get("expirationDate", -1),
+            "httpOnly": c.get("httpOnly", False),
+            "secure": c.get("secure", False),
+            "sameSite": SAME_SITE_MAP.get(
+                (c.get("sameSite") or "").lower(), "None"
+            ),
+        }
+        pw_cookies.append(pw_cookie)
+
+    return {"cookies": pw_cookies, "origins": []}
+
 
 def check_links(urls: list[str], message: telebot.types.Message) -> dict:
     """
@@ -107,6 +147,14 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
         logger.error("cookies.json not found – aborting link check.")
         return {"fresh": [], "used": []}
 
+    # Convert Cookie-Editor format → Playwright storage_state
+    try:
+        storage = convert_cookies_to_playwright("cookies.json")
+    except Exception as conv_err:
+        bot.reply_to(message, f"⚠️ Error reading cookies.json: {conv_err}")
+        logger.error("Cookie conversion failed: %s", conv_err)
+        return {"fresh": [], "used": []}
+
     fresh: list[str] = []
     used: list[str] = []
     is_first_link = True
@@ -114,7 +162,7 @@ def check_links(urls: list[str], message: telebot.types.Message) -> dict:
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(
-            storage_state="cookies.json",
+            storage_state=storage,
             locale="ar-EG",
             user_agent=USER_AGENT,
         )

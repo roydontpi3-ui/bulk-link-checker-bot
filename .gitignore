@@ -3,4 +3,3 @@ __pycache__/
 .env
 debug.png
 fresh_links_result.txt
-cookies.json
